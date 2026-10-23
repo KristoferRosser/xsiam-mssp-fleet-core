@@ -344,7 +344,7 @@ def test_converge_apply_routes_local_via_source_and_upstream_via_download(
     )
 
     # Avoid deleting a real temp file in the finally-block.
-    monkeypatch.setattr(deploy_tenant.os, "unlink", lambda p: None)
+    monkeypatch.setattr(deploy_tenant.shutil, "rmtree", lambda p: None)
 
     deploy_tenant.converge(tenant, apply=True, offline=False, installed_fixture=None)
 
