@@ -49,6 +49,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+import shutil
 from pathlib import Path
 
 from resolve import (resolve, owned_pins, ResolveError, load, local_packs,
@@ -190,8 +191,17 @@ def download(url):
     canonical/deterministic (see scripts/mssp_catalog.py) — the auth dance
     lives only here.
     """
+
+    """
+    Patched here to remediate Packs/ problem occuring in sdk_upload.
+    Preserving the filename so that it can be parsed and used as dir.
+    Original methodology:
     fd, path = tempfile.mkstemp(suffix=".zip")
     os.close(fd)
+    """
+    filename = os.path.basename(urllib.parse.urlparse(url).path)
+    temp_dir = tempfile.mkdtemp()
+    path = os.path.join(temp_dir, filename)
 
     m = parse_release_asset(url)
     token = _github_token()
@@ -297,9 +307,25 @@ def sdk_upload(zip_path, creds, config_overlay=None):
             Encountered error in converge action.
             Packs with multiple directories were not evaluating from releases properly.
             Added conditional to prevent false positive DeployError.
+            NOTE: Had to deploy fix for the fix. Using static Packs/Staged causes problems
+            when multiple packs without IDs specified come in. More robust method to generate
+            Packs/<Pack Name> applied. Uses ID falls back to filename without version.
             """
             if "pack_metadata.json" in zf.namelist():
-                zf.extractall(packs / "Staged") # Automatically creates directory for pack
+
+                # Try Block - try to get "id" from pack metadata set as None on exception
+                try:
+                    pack_name = json.loads(zf.read("pack_metadata.json")).get("id")
+                except Exception:
+                    pack_name = None
+
+                # Conditional - IF the pack_name is falsy, THEN generate it from stem
+                if not pack_name:
+                    file_stem = Path(zip_path).stem  # e.g. would be 'ExamplePack-v1.0.0'
+                    pack_name = file_stem.split('-v')[0] # now it's ExamplePack
+
+                zf.extractall(packs / pack_name)
+
             else:
                 zf.extractall(packs) # original methodology, preserves regression
                 
@@ -478,7 +504,8 @@ def converge(tenant, apply, offline, installed_fixture):
                     else:
                         sdk_upload(zpath, creds)
                 finally:
-                    os.unlink(zpath)
+                    # Replaced original os.unlink(zpath) to ensure entire tmp directory is removed
+                    shutil.rmtree(os.path.dirname(zpath)) 
         except Exception as e:  # noqa: BLE001
             first = (str(e).splitlines() or [""])[0] or e.__class__.__name__
             failures.append((it["id"], it["version"], first))
