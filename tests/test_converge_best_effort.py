@@ -48,7 +48,7 @@ def _mock_live_seams(monkeypatch, tenant, installed=None):
             "zip_url": f"https://example.invalid/{pid}-{v}.zip", "exact": True
         },
     )
-    monkeypatch.setattr(deploy_tenant.os, "unlink", lambda p: None)
+    monkeypatch.setattr(deploy_tenant.shutil, "rmtree", lambda p: None)
 
     rec = {"downloaded": [], "uploaded": [], "source_uploaded": [], "deleted": []}
     monkeypatch.setattr(

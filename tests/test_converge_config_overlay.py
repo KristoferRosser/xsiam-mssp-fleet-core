@@ -241,7 +241,7 @@ def _mock_live_seams(monkeypatch, tenant, carries, installed=None, fails=()):
         lambda pid, v, url, commit: {
             "zip_url": f"https://example.invalid/{pid}-{v}.zip", "exact": True},
     )
-    monkeypatch.setattr(deploy_tenant.os, "unlink", lambda p: None)
+    monkeypatch.setattr(deploy_tenant.shutil, "rmtree", lambda p: None)
     monkeypatch.setattr(deploy_tenant, "download", lambda url: f"/tmp/{url.rsplit('/', 1)[-1]}")
 
     rec = {"uploaded": [], "overlays": [], "deleted": []}

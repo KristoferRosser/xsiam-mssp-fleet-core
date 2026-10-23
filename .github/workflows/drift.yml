@@ -1,16 +1,16 @@
 # ============================================================================
 # drift.yml — fleet drift detection
 # ----------------------------------------------------------------------------
+# Only performs work if FLEET_LIVE variable is present in repository and true.
+# Performs calls to all configured tenants and updates installed_state.yml
+# Runs 'scripts/update_installed_state.py' on each tenant in fleet/tenants/
+# Utilizes that tenant's configured credentials via scripts/load_creds.py
+# NOTE: Does not push updated installed_state.yml to Repo
+#
 # Compares each tenant's RESOLVED versions (ring pins) against installed
 # versions and opens an issue on drift. Reports only — drift never deletes
 # (that's converge's orphan step). Customer-prefixed content is
 # ignored by the checker.
-#
-# workflow_dispatch only. The daily schedule is intentionally disabled
-# because the installed-state is still a committed fixture — a nightly run would
-# open a duplicate drift issue every day. Re-enable `schedule:` once the fixture
-# step is replaced with a real per-tenant fetch (GET /contentpacks/metadata/
-# installed) into the same {tenant: {id: version}} shape.
 # ============================================================================
 name: drift
 
@@ -25,28 +25,57 @@ permissions:
 
 jobs:
   drift:
+    # Skip the entire job cleanly (stays green) if FLEET_LIVE is not 'true'
+    if: vars.FLEET_LIVE == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
+        
       - run: pip install pyyaml
 
-      # When going live: replace this fixture copy with a real per-tenant fetch
-      # (GET /contentpacks/metadata/installed per tenant) into the same shape.
       - name: Build installed-state
-        run: cp fixtures/installed_state.sample.yml installed_state.yml
+        env:
+          ALL_SECRETS: ${{ toJson(secrets) }}
+        run: |
+          set -euo pipefail
+
+          # Iterate sequentially over all configured tenants
+          for f in fleet/tenants/*.yml; do
+            # Handle edge case where directory is empty
+            [ -e "$f" ] || continue
+            
+            TENANT=$(basename "$f" .yml)
+            echo "Fetching installed state for tenant: $TENANT"
+            
+            # Load credentials for this tenant into the environment
+            eval "$(python scripts/load_creds.py "$TENANT")"
+            
+            # Update the installed_state.yml file
+            python scripts/update_installed_state.py -t "$TENANT"
+          done
 
       - name: Check drift
         id: check
-        run: |
+        run: |          
+          # IF installed_state.yml doesn't exist or is empty (0 bytes), 
+          # THEN, skip the check to prevent massive false-positive "MISSING" drift reports.
+          if [ ! -s installed_state.yml ]; then
+            echo "installed_state.yml is missing or empty. Skipping drift check."
+            echo "drift=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          
+          # Perform the drift check on installed_state.yml
           set +e
           python scripts/drift_check.py --state installed_state.yml --json > drift.json
           echo "drift=$?" >> "$GITHUB_OUTPUT"
           python scripts/drift_check.py --state installed_state.yml || true
 
       # Report-only: open an issue when drift is found. The `drift` label must
-      # exist in the repo — GitHub's issue API does not auto-create labels.
+      # exist in the repo — try/catch will verify and abort creation with warning.
       - name: Open issue on drift
         if: steps.check.outputs.drift != '0'
         uses: actions/github-script@v7
@@ -54,14 +83,65 @@ jobs:
           script: |
             const fs = require('fs');
             const data = JSON.parse(fs.readFileSync('drift.json', 'utf8'));
-            const lines = data.reports.flatMap(r =>
-              r.drift.map(d => `- **${r.tenant}** \`${d.pack}\`: installed ${d.installed ?? 'none'} ≠ resolved ${d.pinned}`));
-            await github.rest.issues.create({
-              owner: context.repo.owner, repo: context.repo.repo,
-              title: `Fleet drift detected (${data.total_drift} pack(s))`,
-              body: lines.join('\n') + '\n\n_Filed by the drift workflow._',
-              labels: ['drift'],
-            });
+            const labelName = 'drift';
+
+            /* Try block houses label check/creation
+            Failures do not produce error, only warning
+            Kept all nested throws within outter try/block
+            Does not try to create issue if label does not exist -
+            or fails at label creation */
+            try {
+              let labelExists = false;
+              try {
+                await github.rest.issues.getLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name: labelName
+                });
+                labelExists = true;
+              } catch (error) {
+                if (error.status === 404) {
+                  labelExists = false;
+                } else {
+                  throw new Error(`Label GET failed. Status: ${error.status} - ${error.message}`);
+                }
+              }
+              // IF label doesn't exist, THEN TRY to create the label
+              if (!labelExists) {
+                try {
+                  await github.rest.issues.createLabel({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    name: labelName,
+                    color: 'd73a4a', 
+                    description: 'Tracks fleet drift detection'
+                  });
+                } catch (error) {
+                  throw new Error(`Label POST failed. Status: ${error.status} - ${error.message}`);
+                }
+              }
+
+              // Create the Issue here
+              const lines = data.reports.flatMap(r =>
+                r.drift.map(d => `- **${r.tenant}** \`${d.pack}\`: installed ${d.installed ?? 'none'} ≠ resolved ${d.pinned}`));
+
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `Fleet drift detected (${data.total_drift} pack(s))`,
+                body: lines.join('\n') + '\n\n_Filed by the drift workflow._',
+                labels: [labelName],
+              });
+
+            // Any problems found during label check/creation surface here.
+            } catch (mainError) {
+              // Output troubleshooting diagnostic information and exit cleanly to prevent a failed action
+              console.error("Diagnostic Info: Skipping issue creation due to API error.");
+              console.error(mainError);
+              
+              // core.warning (should) create a yellow annotation on the Action's summary page
+              core.warning(`Drift was detected, but the issue could not be created: ${mainError.message}`);
+            }
 
       # Drift is a report, not a build failure — the job stays green so the
       # Actions tab isn't perpetually red. It fails only on an unexpected error.
